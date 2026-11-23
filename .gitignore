@@ -1,0 +1,25 @@
+# Android build outputs
+build/
+build_bin/
+*.apk
+*.aab
+*.aar
+
+# Gradle
+.gradle/
+gradle/wrapper/gradle-wrapper.jar
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keystore / secrets
+*.jks
+*.keystore
+google-services.json
