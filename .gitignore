@@ -1,25 +1,22 @@
-# Android build outputs
-build/
-build_bin/
-*.apk
-*.aab
-*.aar
-
-# Gradle
+# Gradle / build output (this project redirects the build dir to app/build_bin)
 .gradle/
-gradle/wrapper/gradle-wrapper.jar
-local.properties
+build/
+**/build/
+**/build_bin/
 
-# IDE
+# Machine-specific
+local.properties
 .idea/
 *.iml
-.vscode/
-
-# OS
 .DS_Store
-Thumbs.db
 
-# Keystore / secrets
+# Android
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Keystores
 *.jks
 *.keystore
-google-services.json

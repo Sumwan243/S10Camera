@@ -36,6 +36,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.samsung.android.scan3d.camera.AspectMode
 import com.samsung.android.scan3d.camera.FlashMode
 import com.samsung.android.scan3d.camera.LensType
 
@@ -261,10 +262,12 @@ fun GCamTopBar(
     flashMode: FlashMode,
     timerMode: TimerMode,
     gridMode: GridMode,
+    aspectMode: AspectMode,
     isHdrAutoOn: Boolean,
     onCycleFlash: () -> Unit,
     onCycleTimer: () -> Unit,
     onCycleGrid: () -> Unit,
+    onCycleAspect: () -> Unit,
     onToggleHdr: () -> Unit,
     onToggleDiagnostics: () -> Unit,
     modifier: Modifier = Modifier
@@ -333,6 +336,24 @@ fun GCamTopBar(
             Text(
                 text = if (isHdrAutoOn) "HDR+ AUTO" else "HDR+ OFF",
                 color = if (isHdrAutoOn) GCamYellow else Color.White.copy(alpha = 0.7f),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp
+            )
+        }
+
+        // Aspect Ratio Button (4:3 / 16:9 / 1:1)
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color(0x33000000))
+                .clickable(onClick = onCycleAspect)
+                .padding(horizontal = 10.dp, vertical = 5.dp)
+        ) {
+            Text(
+                text = aspectMode.label,
+                color = Color.White.copy(alpha = 0.9f),
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = 0.5.sp

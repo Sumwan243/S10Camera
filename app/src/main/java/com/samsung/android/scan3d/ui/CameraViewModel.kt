@@ -15,6 +15,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.samsung.android.scan3d.camera.CameraEngine
+import com.samsung.android.scan3d.camera.AspectMode
 import com.samsung.android.scan3d.camera.CameraInfo
 import com.samsung.android.scan3d.camera.FlashMode
 import com.samsung.android.scan3d.camera.LensType
@@ -54,6 +55,9 @@ data class CameraUiState(
     val cameras: List<CameraInfo> = emptyList(),
     val activeCamera: CameraInfo? = null,
     val selectedLens: LensType = LensType.MAIN_WIDE,
+    // Requested output aspect ratio, and the real displayed (portrait) w/h of the stream the engine is using.
+    val aspectMode: AspectMode = AspectMode.RATIO_4_3,
+    val previewAspect: Float = 3f / 4f,
     val zoomRatio: Float = 1.0f,
     val captureMode: CaptureMode = CaptureMode.CAMERA,
     // Real Controls (Zero Placeholders)
@@ -104,6 +108,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         engine.startBackgroundThread()
         // Preload latest photo from DCIM/S10ProCamera so gallery button is immediately ready!
         refreshLatestPhoto()
+
+        // The engine knows the real stream size; the UI sizes the viewfinder from it so it's never stretched.
+        viewModelScope.launch {
+            engine.previewAspect.collect { aspect ->
+                _uiState.update { it.copy(previewAspect = aspect) }
+            }
+        }
     }
 
     private fun refreshLatestPhoto() {
@@ -222,6 +233,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         // zoom doesn't jump back to 1.0x / 2.0x in the middle of a pinch.
         engine.setZoomRatio(clamped.coerceAtLeast(1.0f))
         _uiState.update { it.copy(zoomRatio = clamped) }
+    }
+
+    /** Tap-to-focus; (x, y) are normalised 0..1 positions inside the displayed viewfinder. */
+    fun onTapToFocus(x: Float, y: Float) {
+        engine.focusAt(x, y)
+    }
+
+    // Aspect Ratio Cycling (4:3 -> 16:9 -> 1:1 -> 4:3). Needs a new capture session, so the camera is re-opened.
+    fun cycleAspectMode() {
+        if (_uiState.value.isCapturing) return
+        val next = when (_uiState.value.aspectMode) {
+            AspectMode.RATIO_4_3 -> AspectMode.RATIO_16_9
+            AspectMode.RATIO_16_9 -> AspectMode.RATIO_1_1
+            AspectMode.RATIO_1_1 -> AspectMode.RATIO_4_3
+        }
+        _uiState.update { it.copy(aspectMode = next) }
+        engine.setAspectMode(next)
+        val cameraId = _uiState.value.activeCamera?.id
+            ?: cameraForLens(_uiState.value.cameras, _uiState.value.selectedLens)?.id
+        if (cameraId != null) openCameraById(cameraId)
     }
 
     fun toggleFrontBack() {

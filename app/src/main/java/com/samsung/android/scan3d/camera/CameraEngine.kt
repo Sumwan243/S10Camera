@@ -14,7 +14,10 @@ import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import android.hardware.camera2.params.MeteringRectangle
 import androidx.core.content.ContextCompat
+import kotlin.math.abs
+import kotlin.math.min
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -66,6 +69,16 @@ enum class FlashMode {
     TORCH
 }
 
+/** Output aspect ratio (sensor/landscape orientation: width:height). Preview AND still use the same one. */
+enum class AspectMode(val label: String, val w: Int, val h: Int) {
+    RATIO_4_3("4:3", 4, 3),
+    RATIO_16_9("16:9", 16, 9),
+    RATIO_1_1("1:1", 1, 1);
+
+    fun matches(size: Size): Boolean =
+        abs(size.width.toFloat() / size.height - w.toFloat() / h) < 0.02f
+}
+
 class CameraEngine(private val context: Context) {
 
     companion object {
@@ -77,6 +90,9 @@ class CameraEngine(private val context: Context) {
         /** Preview is capped well below sensor resolution; it must be a size the camera lists for SurfaceTexture. */
         private const val PREVIEW_MAX_WIDTH = 1920
         private const val READER_MAX_IMAGES = 8
+
+        /** How long a tap-to-focus lock is held before returning to continuous autofocus. */
+        private const val FOCUS_HOLD_MS = 3000L
 
         /** HDR burst frames are underexposed by this many AE-compensation steps to protect highlights. */
         private const val HDR_EV_STEPS = -3
@@ -105,6 +121,20 @@ class CameraEngine(private val context: Context) {
     @Volatile private var activeChars: CameraCharacteristics? = null
     private var previewSurface: Surface? = null
     private var currentTexture: SurfaceTexture? = null
+
+    // Aspect ratio: [aspectMode] is what the user asked for, [openedAspect] what the open session was built with.
+    @Volatile private var aspectMode: AspectMode = AspectMode.RATIO_4_3
+    @Volatile private var openedAspect: AspectMode? = null
+    @Volatile private var previewBufferSize: Size? = null
+    @Volatile private var captureSize: Size = Size(4032, 3024)
+
+    /** Displayed (portrait) width/height of the preview, so the UI can size the viewfinder exactly. */
+    private val _previewAspect = MutableStateFlow(3f / 4f)
+    val previewAspect: StateFlow<Float> = _previewAspect.asStateFlow()
+
+    // Tap-to-focus state
+    @Volatile private var meteringRegion: MeteringRectangle? = null
+    @Volatile private var focusReleaseRunnable: Runnable? = null
 
     /** Incremented every time a camera is closed; lets stale async callbacks recognise they are outdated. */
     @Volatile private var openToken = 0
@@ -268,7 +298,8 @@ class CameraEngine(private val context: Context) {
         }
 
         // Avoid re-opening the identical camera with the identical surface
-        if (cameraDevice?.id == cameraId && captureSession != null && currentTexture === texture) {
+        if (cameraDevice?.id == cameraId && captureSession != null && currentTexture === texture &&
+            openedAspect == aspectMode) {
             onReady()
             return
         }
@@ -286,7 +317,11 @@ class CameraEngine(private val context: Context) {
         // The preview buffer size MUST be one of the sizes this particular camera lists for
         // SurfaceTexture outputs. A hard-coded 4032x3024 is not valid for the ultra-wide or front lenses
         // (their sensors are different sizes), which makes session configuration fail -> black preview.
-        val previewSize = pickPreviewSize(chars)
+        val (previewSize, stillSize) = resolveStreamSizes(chars, aspectMode)
+        captureSize = stillSize
+        previewBufferSize = previewSize
+        openedAspect = aspectMode
+        _previewAspect.value = displayedAspect(chars, previewSize)
         val surface = try {
             texture.setDefaultBufferSize(previewSize.width, previewSize.height)
             Surface(texture)
@@ -337,22 +372,50 @@ class CameraEngine(private val context: Context) {
         }
     }
 
-    private fun pickPreviewSize(chars: CameraCharacteristics): Size {
+    /**
+     * Picks (preview size, still size) that share one aspect ratio, so what you see is what you get.
+     * Uses the requested ratio when THIS camera offers it for both streams, otherwise falls back
+     * (4:3, 16:9, 1:1 in that order) - e.g. a front camera that has no 1:1 mode.
+     * Both sizes must come from the camera's own lists; an unlisted size makes session configuration fail.
+     */
+    private fun resolveStreamSizes(chars: CameraCharacteristics, requested: AspectMode): Pair<Size, Size> {
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val sizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
-        val fourThree = sizes.filter { it.width * 3 == it.height * 4 && it.width <= PREVIEW_MAX_WIDTH }
-        return fourThree.maxByOrNull { it.width * it.height }
-            ?: sizes.filter { it.width <= PREVIEW_MAX_WIDTH }.maxByOrNull { it.width * it.height }
+        val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
+        val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
+
+        val candidates = listOf(requested, AspectMode.RATIO_4_3, AspectMode.RATIO_16_9, AspectMode.RATIO_1_1).distinct()
+        for (aspect in candidates) {
+            val previews = previewSizes.filter { aspect.matches(it) }
+            val stills = jpegSizes.filter { aspect.matches(it) }
+            if (previews.isEmpty() || stills.isEmpty()) continue
+
+            val preview = previews.filter { it.width <= PREVIEW_MAX_WIDTH }.maxByOrNull { it.width * it.height }
+                ?: previews.minByOrNull { it.width * it.height }
+                ?: previews.first()
+            val still = stills.maxByOrNull { it.width * it.height } ?: stills.first()
+            return preview to still
+        }
+
+        // Unknown geometry: use the largest sizes we are allowed to.
+        val preview = previewSizes.filter { it.width <= PREVIEW_MAX_WIDTH }.maxByOrNull { it.width * it.height }
             ?: Size(1440, 1080)
+        val still = jpegSizes.maxByOrNull { it.width * it.height } ?: Size(4032, 3024)
+        return preview to still
     }
 
-    private fun pickCaptureSize(chars: CameraCharacteristics): Size {
-        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
-        // Prefer the largest 4:3 size so stills match the 4:3 viewfinder.
-        return jpegSizes.filter { it.width * 3 == it.height * 4 }.maxByOrNull { it.width * it.height }
-            ?: jpegSizes.maxByOrNull { it.width * it.height }
-            ?: Size(4032, 3024)
+    /**
+     * Portrait (displayed) width/height of a stream. The sensor is mounted rotated (90 or 270 on the S10), so the
+     * landscape buffer appears turned on its side when the phone is held upright.
+     */
+    private fun displayedAspect(chars: CameraCharacteristics, size: Size): Float {
+        val orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val swap = orientation % 180 == 90
+        return if (swap) size.height.toFloat() / size.width else size.width.toFloat() / size.height
+    }
+
+    /** Requested aspect ratio; the caller must re-open the camera for it to take effect. */
+    fun setAspectMode(mode: AspectMode) {
+        aspectMode = mode
     }
 
     /**
@@ -372,7 +435,7 @@ class CameraEngine(private val context: Context) {
                 return
             }
 
-            val maxSize = pickCaptureSize(chars)
+            val maxSize = captureSize
 
             imageReader?.close()
             val reader = ImageReader.newInstance(maxSize.width, maxSize.height, ImageFormat.JPEG, READER_MAX_IMAGES)
@@ -452,6 +515,95 @@ class CameraEngine(private val context: Context) {
         refreshPreview()
     }
 
+    /**
+     * Tap-to-focus + tap-to-meter. (nx, ny) is the tap inside the DISPLAYED viewfinder, normalised 0..1 from
+     * the top-left. The point is mapped back into sensor coordinates: undo the selfie mirror, undo the sensor
+     * rotation, then account for the zoom crop and for the crop to the stream's aspect ratio.
+     */
+    fun focusAt(nx: Float, ny: Float) {
+        val chars = activeChars ?: return
+        val builder = previewRequestBuilder ?: return
+        val session = captureSession ?: return
+        val handler = backgroundHandler ?: return
+        val bufferSize = previewBufferSize ?: return
+        val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+
+        val orientation = ((chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90) % 360 + 360) % 360
+        val front = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+
+        // Displayed, un-mirrored, upright coordinates
+        val u = if (front) 1f - nx.coerceIn(0f, 1f) else nx.coerceIn(0f, 1f)
+        val v = ny.coerceIn(0f, 1f)
+        // Rotate into the sensor's own frame
+        val sx: Float
+        val sy: Float
+        when (orientation) {
+            90 -> { sx = v; sy = 1f - u }
+            180 -> { sx = 1f - u; sy = 1f - v }
+            270 -> { sx = 1f - v; sy = u }
+            else -> { sx = u; sy = v }
+        }
+
+        // The part of the sensor that is actually visible: zoom crop, then cropped to the stream aspect ratio.
+        val zoom = currentZoom.coerceAtLeast(1f)
+        var cw = active.width() / zoom
+        var ch = active.height() / zoom
+        val streamAspect = bufferSize.width.toFloat() / bufferSize.height
+        if (cw / ch > streamAspect) cw = ch * streamAspect else ch = cw / streamAspect
+
+        val px = active.exactCenterX() - cw / 2f + sx * cw
+        val py = active.exactCenterY() - ch / 2f + sy * ch
+
+        val side = (min(cw, ch) * 0.15f).toInt().coerceAtLeast(32)
+        val left = (px - side / 2f).toInt().coerceIn(active.left, (active.right - side).coerceAtLeast(active.left))
+        val top = (py - side / 2f).toInt().coerceIn(active.top, (active.bottom - side).coerceAtLeast(active.top))
+
+        meteringRegion = MeteringRectangle(left, top, side, side, MeteringRectangle.METERING_WEIGHT_MAX)
+        focusReleaseRunnable?.let { handler.removeCallbacks(it) }
+
+        try {
+            applyControls(builder, chars, hdr = false)
+
+            val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
+            val minFocus = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+            // Fixed-focus lenses (ultra-wide, front) can't focus, but metering still follows the tap.
+            val canFocus = manualFocusDistance == null && minFocus > 0f &&
+                CameraMetadata.CONTROL_AF_MODE_AUTO in afModes
+            if (canFocus) {
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                session.capture(builder.build(), null, handler)
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                session.capture(builder.build(), null, handler)
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            }
+            session.setRepeatingRequest(builder.build(), null, handler)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Tap-to-focus failed", t)
+        }
+
+        val release = Runnable { releaseFocusLock() }
+        focusReleaseRunnable = release
+        handler.postDelayed(release, FOCUS_HOLD_MS)
+    }
+
+    /** Returns to continuous autofocus / full-frame metering after a tap-to-focus. */
+    private fun releaseFocusLock() {
+        if (meteringRegion == null) return
+        meteringRegion = null
+        val builder = previewRequestBuilder ?: return
+        val chars = activeChars ?: return
+        val session = captureSession ?: return
+        try {
+            applyControls(builder, chars, hdr = false)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+            session.capture(builder.build(), null, backgroundHandler)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Releasing focus lock failed", t)
+        }
+    }
+
     private fun refreshPreview() {
         val builder = previewRequestBuilder ?: return
         val chars = activeChars ?: return
@@ -482,6 +634,9 @@ class CameraEngine(private val context: Context) {
         if (focus != null && minFocusDistance > 0f) {
             builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
             builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focus.coerceIn(0f, minFocusDistance))
+        } else if (meteringRegion != null && CameraMetadata.CONTROL_AF_MODE_AUTO in afModes) {
+            // Tap-to-focus in progress: single-shot AF so the lens holds where the user tapped.
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
         } else if (CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE in afModes) {
             builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
         } else if (CameraMetadata.CONTROL_AF_MODE_AUTO in afModes) {
@@ -535,6 +690,19 @@ class CameraEngine(private val context: Context) {
         if (awbMode in awbModes) {
             builder.set(CaptureRequest.CONTROL_AWB_MODE, awbMode)
         }
+
+        // --- Tap-to-focus / metering regions ----------------------------------------------------
+        val region = meteringRegion
+        val maxAfRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+        val maxAeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+        builder.set(
+            CaptureRequest.CONTROL_AF_REGIONS,
+            if (region != null && maxAfRegions > 0 && focus == null) arrayOf(region) else null
+        )
+        builder.set(
+            CaptureRequest.CONTROL_AE_REGIONS,
+            if (region != null && maxAeRegions > 0 && !manualExposure) arrayOf(region) else null
+        )
 
         // --- Zoom ------------------------------------------------------------------------------
         applyZoomToBuilder(builder, chars, currentZoom)
@@ -688,6 +856,12 @@ class CameraEngine(private val context: Context) {
 
     fun closeCamera() {
         openToken++
+
+        focusReleaseRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+        focusReleaseRunnable = null
+        meteringRegion = null
+        openedAspect = null
+        previewBufferSize = null
 
         try { captureSession?.stopRepeating() } catch (_: Throwable) {}
         try { captureSession?.close() } catch (_: Throwable) {}
