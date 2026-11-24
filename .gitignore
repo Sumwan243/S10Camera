@@ -1,14 +1,16 @@
-# Gradle / build output (this project redirects the build dir to app/build_bin)
+# Gradle / build output (redirected to app/build_bin)
 .gradle/
 build/
 **/build/
 **/build_bin/
 
-# Machine-specific
+# Machine-specific / IDE
 local.properties
 .idea/
+.vscode/
 *.iml
 .DS_Store
+Thumbs.db
 
 # Android
 *.apk
@@ -17,6 +19,7 @@ captures/
 .externalNativeBuild/
 .cxx/
 
-# Keystores
+# Keystores & secrets
 *.jks
 *.keystore
+google-services.json
